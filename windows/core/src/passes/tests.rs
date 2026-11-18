@@ -11005,3 +11005,166 @@ fn rule_k_leaves_a_pass_with_another_colour_target_beside_render_target_0() {
     assert_eq!(pass.color_load(), ColorLoad::Load);
     assert_eq!(pass.extra_color()[0].load(), ColorLoad::Load);
 }
+
+/// A multisampled target with one draw in an open pass, as a scene pass leaves it.
+fn drawn_multisampled_target(
+    rt: MetalHandle<MTLTextureKind>,
+    rt_msaa: MetalHandle<MTLTextureKind>,
+) -> PassState {
+    let mut s = fresh();
+    s.set_color_render_target(rt, BB_SIZE.0, BB_SIZE.1, BB_FORMAT, RenderScale::IDENTITY);
+    s.set_color_msaa(rt_msaa, MetalHandle::NULL, 4);
+    s.emit_command(dummy_draw());
+    s
+}
+
+#[test]
+fn a_whole_surface_copy_takes_the_resolve() {
+    // StretchRect(rt -> dst) over both whole surfaces right after the pass
+    // that drew rt: that pass writes dst itself and no copy is queued.
+    let (rt, rt_msaa, dst) = (tex(0x3500), tex(0x3501), tex(0x3502));
+    let mut s = drawn_multisampled_target(rt, rt_msaa);
+    assert!(s.redirect_msaa_resolve(rt, dst, false));
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+
+    assert_eq!(s.passes().len(), 1);
+    assert_eq!(
+        s.passes()[0].color_resolve_texture(),
+        dst,
+        "the end of the submission leaves the redirected resolve alone"
+    );
+    assert_eq!(s.passes()[0].color_attachment_texture(), rt_msaa);
+    assert!(
+        matches!(s.passes()[0].color_store(), StoreAction::Store),
+        "the samples are kept for whoever reads rt next"
+    );
+    assert!(
+        s.texture_written_by_blit_this_frame(dst),
+        "a later pass on dst loads what the resolve wrote"
+    );
+}
+
+#[test]
+fn a_whole_surface_copy_is_refused_where_it_would_reorder() {
+    let (rt, rt_msaa, dst) = (tex(0x3510), tex(0x3511), tex(0x3512));
+
+    // A copy already waits behind the pass: it was ordered before this one.
+    let mut s = drawn_multisampled_target(rt, rt_msaa);
+    s.end_current_pass("test");
+    s.push_pending_leading_blit(copy_blit(tex(0x3513), tex(0x3514)));
+    assert!(!s.redirect_msaa_resolve(rt, dst, false));
+
+    // The pass already resolves into the twin for an earlier reader.
+    let mut s = drawn_multisampled_target(rt, rt_msaa);
+    s.note_msaa_read(rt);
+    assert!(!s.redirect_msaa_resolve(rt, dst, false));
+
+    // Another pass came after the one that drew rt.
+    let mut s = drawn_multisampled_target(rt, rt_msaa);
+    s.set_color_render_target(
+        tex(0x3515),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_color_msaa(MetalHandle::NULL, MetalHandle::NULL, 1);
+    s.emit_command(dummy_draw());
+    assert!(!s.redirect_msaa_resolve(rt, dst, false));
+
+    // The back buffer's twin is what `Present` shows.
+    let mut s = fresh_multisampled();
+    s.emit_command(dummy_draw());
+    assert!(!s.redirect_msaa_resolve(backbuffer(), dst, false));
+}
+
+#[test]
+fn a_second_read_rebuilds_the_twin_from_the_samples() {
+    // StretchRect(rt -> dst) taken as the resolve, then a second read of rt
+    // with nothing drawn in between: the pass cannot resolve twice, so a
+    // pass of its own loads the samples and writes the twin.
+    let (rt, rt_msaa, dst) = (tex(0x3520), tex(0x3521), tex(0x3522));
+    let mut s = drawn_multisampled_target(rt, rt_msaa);
+    assert!(s.redirect_msaa_resolve(rt, dst, false));
+    s.end_current_pass("test");
+    s.note_msaa_read(rt);
+    s.push_pending_leading_blit(copy_blit(rt, tex(0x3523)));
+    s.finalize_store_actions(false);
+
+    assert_eq!(s.passes().len(), 2);
+    assert_eq!(s.passes()[0].color_resolve_texture(), dst);
+    assert!(
+        matches!(s.passes()[0].color_store(), StoreAction::Store),
+        "the resolve-only pass loads these samples"
+    );
+    let twin = &s.passes()[1];
+    assert_eq!(twin.color_attachment_texture(), rt_msaa);
+    assert_eq!(twin.color_resolve_texture(), rt);
+    assert!(matches!(twin.color_load(), ColorLoad::Load));
+    assert_eq!(twin.commands().len(), 0);
+
+    // A third read finds the twin current and adds nothing.
+    s.note_msaa_read(rt);
+    assert_eq!(s.passes().len(), 2);
+}
+
+#[test]
+fn a_stale_twin_is_rebuilt_in_a_later_frame() {
+    let (rt, rt_msaa, dst) = (tex(0x3530), tex(0x3531), tex(0x3532));
+    let mut s = drawn_multisampled_target(rt, rt_msaa);
+    assert!(s.redirect_msaa_resolve(rt, dst, false));
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+    reset_test_frame(&mut s);
+
+    // Nothing has drawn into rt this frame, and something reads it.
+    s.note_msaa_read(rt);
+    assert_eq!(s.passes().len(), 1);
+    assert_eq!(s.passes()[0].color_attachment_texture(), rt_msaa);
+    assert_eq!(s.passes()[0].color_resolve_texture(), rt);
+}
+
+#[test]
+fn a_draw_after_the_copy_resolves_into_the_twin_again() {
+    // rt is drawn, copied whole into dst, then drawn again: the second pass
+    // is the submission's last use and brings the twin up to date itself.
+    let (rt, rt_msaa, dst) = (tex(0x3540), tex(0x3541), tex(0x3542));
+    let mut s = drawn_multisampled_target(rt, rt_msaa);
+    assert!(s.redirect_msaa_resolve(rt, dst, false));
+    s.end_current_pass("test");
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+
+    assert_eq!(
+        s.passes().len(),
+        2,
+        "a resolving pass is never merged into the next"
+    );
+    assert_eq!(s.passes()[0].color_resolve_texture(), dst);
+    assert_eq!(s.passes()[1].color_resolve_texture(), rt);
+    reset_test_frame(&mut s);
+    s.note_msaa_read(rt);
+    assert!(
+        s.passes().is_empty(),
+        "the twin is current, so a read adds no pass"
+    );
+}
+
+#[test]
+fn a_direct_resolve_can_drop_the_samples() {
+    let (rt, rt_msaa, dst) = (tex(0x3550), tex(0x3551), tex(0x3552));
+    let mut s = drawn_multisampled_target(rt, rt_msaa);
+    assert!(s.redirect_msaa_resolve(rt, dst, true));
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+    assert_eq!(s.passes()[0].color_resolve_texture(), dst);
+    assert!(matches!(s.passes()[0].color_store(), StoreAction::DontCare));
+    reset_test_frame(&mut s);
+    s.note_msaa_read(rt);
+    assert!(
+        s.passes().is_empty(),
+        "there are no samples left to rebuild the twin from"
+    );
+}

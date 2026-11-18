@@ -39,6 +39,8 @@ impl WireValue for Mtld3dConfig {
         self.query_flush_immediate.write_wire(writer)?;
         self.query_event_immediate.write_wire(writer)?;
         self.depth_alias_same_size.write_wire(writer)?;
+        self.render_direct_resolve.write_wire(writer)?;
+        self.render_discard_resolved_samples.write_wire(writer)?;
         self.buffer_ignore_lock_bounds.write_wire(writer)?;
         self.vbib_retention_cap_bytes.write_wire(writer)?;
         self.vram_budget_cap_bytes.write_wire(writer)?;
@@ -76,6 +78,8 @@ impl WireValue for Mtld3dConfig {
             query_flush_immediate: <bool>::read_wire(reader)?,
             query_event_immediate: <bool>::read_wire(reader)?,
             depth_alias_same_size: <bool>::read_wire(reader)?,
+            render_direct_resolve: <bool>::read_wire(reader)?,
+            render_discard_resolved_samples: <bool>::read_wire(reader)?,
             buffer_ignore_lock_bounds: <bool>::read_wire(reader)?,
             vbib_retention_cap_bytes: <u64>::read_wire(reader)?,
             vram_budget_cap_bytes: <u64>::read_wire(reader)?,

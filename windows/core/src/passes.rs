@@ -960,6 +960,15 @@ pub struct Pass {
     extra_color: [PassColorAttachment; 3],
 }
 
+/// What it takes to resolve a multisampled target into its twin in a pass that draws nothing.
+#[derive(Clone, Copy)]
+struct StaleTwin {
+    /// The multisampled companion that holds the samples.
+    msaa: MetalHandle<MTLTextureKind>,
+    size: (u32, u32),
+    format: PixelFormat,
+}
+
 impl Pass {
     #[must_use]
     pub const fn color_texture(&self) -> MetalHandle<MTLTextureKind> {
@@ -995,6 +1004,15 @@ impl Pass {
         } else {
             self.color_srgb_texture
         }
+    }
+    /// Whether this pass resolves render target 0 into a texture other than its own twin.
+    ///
+    /// See [`PassState::redirect_msaa_resolve`].
+    #[must_use]
+    pub const fn color_resolve_redirected(&self) -> bool {
+        !self.color_resolve_texture.is_null()
+            && self.color_resolve_texture.raw() != self.color_texture.raw()
+            && self.color_resolve_texture.raw() != self.color_srgb_texture.raw()
     }
     /// Drop colour attachment 0 together with every view of it the render pass could bind.
     ///
@@ -1740,6 +1758,15 @@ pub struct PassState {
     /// flush keeps it, since the copy stays in VRAM for the continuation, and a
     /// real `Present` resets it.
     blit_written_rts: FxHashSet<MetalHandle<MTLTextureKind>>,
+    /// Multisampled targets whose single-sample twin does not hold their latest content.
+    ///
+    /// [`Self::redirect_msaa_resolve`] hands a pass's resolve to the
+    /// destination of a whole-surface `StretchRect`, which leaves the twin
+    /// every other reader knows behind. Keyed by the twin; the value is what
+    /// a resolve-only pass needs to bring it up to date from the stored
+    /// samples. An entry goes when a pass resolves into the twin again.
+    /// Session-wide: the samples are kept across `Present`.
+    stale_twins: FxHashMap<MetalHandle<MTLTextureKind>, StaleTwin>,
     /// The swap-chain backbuffer texture for this frame, captured in `reset_frame`.
     ///
     /// Rule A's colour `DontCare` applies to this handle alone, since only the
@@ -1996,6 +2023,7 @@ impl PassState {
             seen_color_rts: FxHashSet::with_capacity_and_hasher(4, FxBuildHasher),
             seen_depth_rts: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
             blit_written_rts: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
+            stale_twins: FxHashMap::with_capacity_and_hasher(2, FxBuildHasher),
             backbuffer_texture: MetalHandle::NULL,
             backbuffer_contents: BackbufferContents::Undefined,
             // Placeholder; `reset_frame` reseeds it from the frame stamp.
@@ -2424,6 +2452,7 @@ impl PassState {
         self.seen_color_rts.retain(|&(handle, _)| handle != texture);
         self.seen_depth_rts.remove(&texture);
         self.blit_written_rts.remove(&texture);
+        self.stale_twins.remove(&texture);
         self.seen_sampled_textures.remove(&texture);
         self.frame_sampled_textures.remove(&texture);
         self.seen_sampleable_depth_textures.remove(&texture);
@@ -6385,7 +6414,13 @@ impl PassState {
             if !pass.color_msaa_texture.is_null()
                 && resolved.insert((pass.color_texture, pass.color_subresource))
             {
+                if pass.color_resolve_redirected() {
+                    // A whole-surface copy took this resolve as its own; the
+                    // twin stays behind until something asks for it.
+                    continue;
+                }
                 pass.color_resolve_texture = pass.color_resolve_view();
+                self.stale_twins.remove(&pass.color_texture);
                 if discard_backbuffer_samples && pass.color_texture == backbuffer {
                     pass.color_store = StoreAction::DontCare;
                     if log_enabled!(target: TRACE_TARGET, Level::Trace) {
@@ -6416,13 +6451,22 @@ impl PassState {
     /// takes the resolve; a target with no multisampled companion, or one no
     /// pass has touched yet, is a no-op. Called from the `StretchRect` path,
     /// which orders its blit after the passes already recorded.
+    ///
+    /// A pass whose resolve [`Self::redirect_msaa_resolve`] handed to a copy's
+    /// destination cannot take a second one, and a twin left stale by such a
+    /// pass in an earlier submission has no pass here at all: either way a
+    /// resolve-only pass loads the stored samples and writes the twin.
     pub fn note_msaa_read(&mut self, texture: MetalHandle<MTLTextureKind>) {
         if texture.is_null() {
             return;
         }
         for pass in self.passes.iter_mut().rev() {
             if pass.color_texture == texture && !pass.color_msaa_texture.is_null() {
+                if pass.color_resolve_redirected() {
+                    break;
+                }
                 pass.color_resolve_texture = pass.color_resolve_view();
+                self.stale_twins.remove(&texture);
                 return;
             }
             for attachment in &mut pass.extra_color {
@@ -6431,6 +6475,140 @@ impl PassState {
                     return;
                 }
             }
+        }
+        if let Some(stale) = self.stale_twins.remove(&texture) {
+            self.push_twin_resolve_pass(texture, &stale);
+        }
+    }
+
+    /// Hand the resolve of multisampled target `src` to `dst`, the destination of a copy out of it.
+    ///
+    /// `src` is the single-sample twin, as in [`Self::note_msaa_read`]. A
+    /// `StretchRect` that copies the whole of a multisampled target over the
+    /// whole of a single-sampled one of the same format is that target's
+    /// resolve in all but name, so the pass that drew it can write `dst`
+    /// directly instead of writing the twin for a copy to read back out.
+    /// Returns `true` when the most recent pass took the resolve; the caller
+    /// then ends the pass and queues no copy. The caller has checked the
+    /// geometry and formats; this checks the pass list:
+    ///
+    /// - the last pass recorded is the one that drew `src`, through its
+    ///   companion, on subresource 0 and without the sRGB twin, and has no
+    ///   resolve yet, so the write lands exactly where the copy would have
+    ///   been ordered;
+    /// - no copy is queued behind that pass and no draw of the frame has
+    ///   sampled `dst`, so nothing that D3D9 ordered before the copy can see
+    ///   its result;
+    /// - `src` is not the back buffer, whose twin `Present` reads.
+    ///
+    /// The twin is then stale (see `stale_twins`). `dst` counts as written by
+    /// a copy, so a later pass that binds it loads it. With
+    /// `discard_samples` the pass does not store the samples it resolves
+    /// (`render.discardResolvedSamples`), and the twin can no longer be
+    /// rebuilt: the next read of `src` gets what the twin last held.
+    pub fn redirect_msaa_resolve(
+        &mut self,
+        src: MetalHandle<MTLTextureKind>,
+        dst: MetalHandle<MTLTextureKind>,
+        discard_samples: bool,
+    ) -> bool {
+        if src.is_null()
+            || dst.is_null()
+            || src == dst
+            || src == self.backbuffer_texture
+            || !self.pending_leading_blits.is_empty()
+            || self.frame_sampled_textures.contains(&dst)
+            || self.passes.len() <= self.upload_pass_end
+        {
+            return false;
+        }
+        let Some(pass) = self.passes.last_mut() else {
+            return false;
+        };
+        if pass.color_texture != src
+            || pass.color_msaa_texture.is_null()
+            || !pass.color_srgb_texture.is_null()
+            || !pass.color_resolve_texture.is_null()
+            || pass.color_subresource != 0
+            || pass.depth_texture == dst
+            || pass.extra_color.iter().any(|a| a.texture == dst)
+        {
+            return false;
+        }
+        pass.color_resolve_texture = dst;
+        if discard_samples {
+            pass.color_store = StoreAction::DontCare;
+            self.stale_twins.remove(&src);
+        } else {
+            self.stale_twins.insert(
+                src,
+                StaleTwin {
+                    msaa: pass.color_msaa_texture,
+                    size: pass.color_size,
+                    format: pass.color_format,
+                },
+            );
+        }
+        self.blit_written_rts.insert(dst);
+        if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+            trace!(
+                target: TRACE_TARGET,
+                "pass-resolve idx={} color={src:#x} → {dst:#x} (whole-surface copy taken as the resolve)",
+                self.passes.len() - 1,
+            );
+        }
+        true
+    }
+
+    /// Record a closed pass that only resolves a multisampled target's stored samples into its twin.
+    ///
+    /// No draws and no depth: the load brings the samples in, the store keeps
+    /// them, and the resolve does the work.
+    fn push_twin_resolve_pass(&mut self, twin: MetalHandle<MTLTextureKind>, stale: &StaleTwin) {
+        self.end_current_pass("msaa_twin_resolve");
+        let mut commands = self
+            .command_vec_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(16));
+        commands.clear();
+        let (width, height) = stale.size;
+        self.passes.push(Pass {
+            color_texture: twin,
+            color_srgb_texture: MetalHandle::NULL,
+            color_msaa_texture: stale.msaa,
+            color_msaa_srgb_texture: MetalHandle::NULL,
+            color_resolve_texture: twin,
+            color_subresource: 0,
+            color_size: stale.size,
+            color_format: stale.format,
+            color_load: ColorLoad::Load,
+            color_store: StoreAction::Store,
+            depth_texture: MetalHandle::NULL,
+            depth_level: 0,
+            depth_size: (0, 0),
+            depth_load: DepthLoad::DontCare,
+            stencil_load: StencilLoad::DontCare,
+            depth_store: StoreAction::DontCare,
+            stencil_store: StoreAction::DontCare,
+            viewport: (0, 0, width, height),
+            commands,
+            leading_blits: core::mem::take(&mut self.pending_leading_blits),
+            has_counting_visibility: false,
+            visibility_buffer: self.visibility_buffer,
+            depth_flags: PassDepthFlags::empty(),
+            // Nothing draws, but the resolve is a write Rule H must not strip.
+            color_flags: PassColorFlags::WRITES_OBSERVED,
+            color_clear_quad_ranges: Vec::new(),
+            extra_color: [PassColorAttachment::NONE; 3],
+        });
+        self.current_pass_closed = true;
+        self.seen_color_rts.insert((twin, 0));
+        if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+            trace!(
+                target: TRACE_TARGET,
+                "pass-resolve idx={} color={twin:#x} twin rebuilt from stored samples",
+                self.passes.len() - 1,
+            );
         }
     }
 

@@ -498,6 +498,54 @@ fn scale_stretch_region(
     mtld3d_core::stretch_rect::StretchRegion { x, y, w, h }
 }
 
+/// Whether a `StretchRect` is a 1:1 copy of a whole multisampled surface over a whole single-sampled one.
+///
+/// The shape `FrameEncoder::redirect_msaa_resolve` can take as the source's
+/// resolve: level 0 and slice 0 of both, neither scaled by `render.scale`,
+/// equal extents and the same Metal pixel format (a resolve target must match
+/// its attachment), and a destination that is a single-sampled render target
+/// with no mip chain to regenerate.
+fn whole_surface_resolve(
+    enc: &FrameEncoder,
+    src: &records::SurfaceRecord,
+    dst: &records::SurfaceRecord,
+    params: &StretchBlitParams,
+) -> bool {
+    let whole = |info: &records::SurfaceRecord,
+                 region: mtld3d_core::stretch_rect::StretchRegion| {
+        region.x == 0
+            && region.y == 0
+            && region.w == info.width
+            && region.h == info.height
+            && (info.width, info.height) == (info.texture_width, info.texture_height)
+            && RenderScale::from_percent(info.scale).is_identity()
+            && info.mip_level == 0
+            && surface_slice(info).unwrap_or(0) == 0
+            && info.identity.kind != 2
+    };
+    src.msaa != 0
+        && params.source != 0
+        && params.destination != 0
+        && params.source != params.destination
+        && !params.render_quad
+        && params.mip_level == 0
+        && whole(src, params.src_region)
+        && whole(dst, params.dst_region)
+        && (src.width, src.height) == (dst.width, dst.height)
+        && dst.msaa == 0
+        && dst.sample_count <= 1
+        && dst.present & 2 == 0
+        && StretchSurfaceFlags::from_bits_retain(u8::try_from(dst.flags).unwrap_or(0))
+            .contains(StretchSurfaceFlags::IS_RENDER_TARGET)
+        && matches!(
+            (
+                map_for_encoder(src.format, enc).map(|m| m.metal_pixel_format()),
+                map_for_encoder(dst.format, enc).map(|m| m.metal_pixel_format()),
+            ),
+            (Some(a), Some(b)) if a == b
+        )
+}
+
 /// Encoder-thread body of `StretchRect`.
 ///
 /// Resolves both endpoint handles via the texture cache, then either queues a
@@ -534,19 +582,26 @@ fn emit_stretch_rect_blit(
     // SAFETY: `src_handle` came from the encoder's texture cache or from a
     // surface's retained handle, both of which are `MTLTexture` handles.
     let src_texture = unsafe { MetalHandle::<MTLTextureKind>::new(src_handle) };
-    enc.note_msaa_read(src_texture);
-    // A source with a multisampled companion is a resolve target, and a
-    // resolve the last submission stored into it must have completed before
-    // this copy reads it on a device that does not order that itself.
-    if src_info.msaa != 0 {
-        enc.wait_for_resolve_retire();
+    // SAFETY: `dst_handle` came from the encoder's texture cache or from a
+    // surface's retained handle, both of which are `MTLTexture` handles.
+    let dst_texture = unsafe { MetalHandle::<MTLTextureKind>::new(dst_handle) };
+    // A copy of the whole multisampled source over the whole destination is
+    // the source's resolve: the pass that drew it writes the destination
+    // itself and nothing is left to copy (`render.directResolve`).
+    let direct = whole_surface_resolve(enc, src_info, dst_info, params)
+        && enc.redirect_msaa_resolve(src_texture, dst_texture);
+    if !direct {
+        enc.note_msaa_read(src_texture);
+        // A source with a multisampled companion is a resolve target, and a
+        // resolve the last submission stored into it must have completed before
+        // this copy reads it on a device that does not order that itself.
+        if src_info.msaa != 0 {
+            enc.wait_for_resolve_retire();
+        }
     }
     // What the copy writes may be kept for good, and a draw left out of the
     // source would then be baked into it. A copy over a whole colour target
     // rebuilds that target as a clear does.
-    // SAFETY: `dst_handle` came from the encoder's texture cache or from a
-    // surface's retained handle, both of which are `MTLTexture` handles.
-    let dst_texture = unsafe { MetalHandle::<MTLTextureKind>::new(dst_handle) };
     enc.note_stretch_copy(&crate::encoder::StretchCopyTargets {
         src: src_texture,
         dst: dst_texture,
@@ -587,6 +642,17 @@ fn emit_stretch_rect_blit(
             ),
             dst_info.present & 2 != 0,
         );
+    }
+    if direct {
+        // The resolve is the copy. The pass ends here so that a draw D3D9
+        // ordered after the `StretchRect` cannot reach the destination.
+        enc.end_current_pass("stretch_rect");
+        trace!(
+            target: BLIT_TRACE_TARGET,
+            "StretchRect src={src_handle:#x} dst={dst_handle:#x} {}x{} taken as the multisample resolve",
+            src_info.width, src_info.height,
+        );
+        return;
     }
     let (src_dims, dst_dims) = (
         (src_info.texture_width, src_info.texture_height),

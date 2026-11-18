@@ -217,6 +217,30 @@ pub struct Mtld3dConfig {
     /// target before use (the common case) would pay one full-surface
     /// copy per switch for nothing. File key: `depth.aliasSameSize`.
     pub depth_alias_same_size: bool,
+    /// A whole-surface `StretchRect` out of a multisampled render target is taken as its resolve.
+    ///
+    /// D3D9 resolves a multisampled render target by `StretchRect` into a
+    /// single-sampled one. By default the pass that drew the source resolves
+    /// into the source's own single-sample twin and a copy then carries the
+    /// twin into the destination: two full-surface writes. With this on,
+    /// the pass resolves straight into the destination when the copy is 1:1
+    /// over both whole surfaces, the formats agree and nothing else has
+    /// touched either since, and the copy is dropped. The twin is brought up
+    /// to date from the stored samples only if something reads the source
+    /// again before it is next drawn to. Default: `false`. File key:
+    /// `render.directResolve`.
+    pub render_direct_resolve: bool,
+    /// A multisampled render target's samples are dropped once a direct resolve has taken them.
+    ///
+    /// Only with `render.directResolve`. D3D9 keeps a render target's
+    /// contents until they are overwritten, so by default the samples are
+    /// stored as well as resolved. `true` is for an application known to
+    /// clear such a target before it draws to it again and to read it only
+    /// through that one `StretchRect`: the samples are then never loaded
+    /// again and storing them is a full-surface write per frame for nothing.
+    /// A read or an uncleared draw after the resolve sees undefined content.
+    /// Default: `false`. File key: `render.discardResolvedSamples`.
+    pub render_discard_resolved_samples: bool,
     /// Disbelieve the `[OffsetToLock, SizeToLock)` window a `Lock` on a static VB/IB announces.
     ///
     /// Every vertex or index buffer except a `DEFAULT` + `DYNAMIC` one
@@ -413,6 +437,8 @@ impl Default for Mtld3dConfig {
             query_flush_immediate: false,
             query_event_immediate: false,
             depth_alias_same_size: false,
+            render_direct_resolve: false,
+            render_discard_resolved_samples: false,
             buffer_ignore_lock_bounds: false,
             vbib_retention_cap_bytes: 512 * 1024 * 1024,
             // The 32-bit address space is the ceiling that matters, not the
@@ -589,6 +615,14 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
+        "config: render.directResolve = {}", cfg.render_direct_resolve
+    );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: render.discardResolvedSamples = {}", cfg.render_discard_resolved_samples
+    );
+    info!(
+        target: crate::LOG_TARGET,
         "config: buffer.ignoreLockBounds = {}", cfg.buffer_ignore_lock_bounds
     );
     info!(
@@ -695,6 +729,10 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "query.flushImmediate" => assign_bool(source, key, value, &mut cfg.query_flush_immediate),
         "query.eventImmediate" => assign_bool(source, key, value, &mut cfg.query_event_immediate),
         "depth.aliasSameSize" => assign_bool(source, key, value, &mut cfg.depth_alias_same_size),
+        "render.directResolve" => assign_bool(source, key, value, &mut cfg.render_direct_resolve),
+        "render.discardResolvedSamples" => {
+            assign_bool(source, key, value, &mut cfg.render_discard_resolved_samples);
+        }
         "buffer.ignoreLockBounds" => {
             assign_bool(source, key, value, &mut cfg.buffer_ignore_lock_bounds);
         }

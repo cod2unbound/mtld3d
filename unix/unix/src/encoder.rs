@@ -3890,6 +3890,24 @@ impl FrameEncoder {
         self.pass_state.note_msaa_read(handle);
     }
 
+    /// Take a whole-surface copy out of multisampled `src` into `dst` as `src`'s resolve.
+    ///
+    /// See `PassState::redirect_msaa_resolve`. Off unless
+    /// `render.directResolve` is set, and on a device that answered
+    /// `RESOLVE_NEEDS_RETIRE`, where a resolve target is not safe to read
+    /// until its command buffer has completed.
+    pub fn redirect_msaa_resolve(
+        &mut self,
+        src: MetalHandle<MTLTextureKind>,
+        dst: MetalHandle<MTLTextureKind>,
+    ) -> bool {
+        if !self.config.render_direct_resolve || self.gpu_caps.resolve_needs_retire() {
+            return false;
+        }
+        self.pass_state
+            .redirect_msaa_resolve(src, dst, self.config.render_discard_resolved_samples)
+    }
+
     /// Bind mip `level` of `texture`, extent `size`, as the depth/stencil attachment.
     pub fn set_depth_stencil_attachment_level(
         &mut self,

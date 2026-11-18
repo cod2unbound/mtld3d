@@ -40,6 +40,8 @@ fn resolved_configuration_preserves_nondefaults() {
     value.query_flush_immediate = !value.query_flush_immediate;
     value.query_event_immediate = !value.query_event_immediate;
     value.depth_alias_same_size = !value.depth_alias_same_size;
+    value.render_direct_resolve = !value.render_direct_resolve;
+    value.render_discard_resolved_samples = !value.render_discard_resolved_samples;
     value.buffer_ignore_lock_bounds = !value.buffer_ignore_lock_bounds;
     value.vbib_retention_cap_bytes = u64::MAX - 123;
     value.vram_budget_cap_bytes = u64::MAX - 123;
