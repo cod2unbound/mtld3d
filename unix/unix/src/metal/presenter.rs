@@ -456,6 +456,41 @@ fn decide(inner: &Inner, present_bearing: bool) -> Decision {
     }
 }
 
+/// Whether a present-bearing submit lets go of the presents still waiting for a drawable.
+///
+/// A window whose presents are not paced (vsync off, no frame cap riding the
+/// present) shows only the frames the display has room for: the compositor
+/// hands a drawable back a few milliseconds after it took one, however fast
+/// the game draws. Waiting for each present to commit therefore held the
+/// game to the rate drawables come back at, a little over 300 a second,
+/// with nothing gained on screen. Such a window takes the newest frame for
+/// the next drawable instead, and the frames it had no drawable for are
+/// dropped unshown, as a present into an occluded window is. A paced window
+/// keeps every frame, since the pace is the point of it.
+/// `MTLD3D_PRESENT_EVERY_FRAME` in the environment keeps every frame for
+/// every window.
+fn newest_wins(inner: &Inner) -> bool {
+    static EVERY_FRAME: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *EVERY_FRAME.get_or_init(|| std::env::var_os("MTLD3D_PRESENT_EVERY_FRAME").is_some()) {
+        return false;
+    }
+    inner
+        .pending
+        .back()
+        .is_some_and(|newest| pacing(attachment::find(newest.view).as_deref()).is_none())
+}
+
+/// Drop every pending present unshown: a newer frame is about to take their place.
+///
+/// Under the caller's lock, so the presenter is not inside an encode: it
+/// either has not taken the front packet yet or is waiting for a drawable,
+/// and reads the queue again once it has one.
+fn supersede_pending(inner: &mut Inner) {
+    while let Some(packet) = inner.pending.pop_front() {
+        drop_packet(inner, packet);
+    }
+}
+
 /// The first free slot, else the one whose reader is oldest.
 fn choose_slot(inner: &Inner) -> SlotChoice {
     let committed = inner.committed_present_seq;
@@ -627,6 +662,12 @@ pub fn resolve_present_conflict(
     loop {
         match decide(&inner, present_bearing) {
             Decision::Proceed => break,
+            Decision::Wait(seq) if newest_wins(&inner) => {
+                mtld3d_shared::crumb!("submit:supersede", seq);
+                supersede_pending(&mut inner);
+                state.submit_cv.notify_all();
+                break;
+            }
             Decision::Wait(seq) => {
                 mtld3d_shared::crumb!("submit:presentwait", seq);
                 let _wait = NanosSetTimer::start(&raw mut params.present_wait_ns);
@@ -793,11 +834,13 @@ fn drop_packet(inner: &mut Inner, packet: PresentPacket) {
 }
 
 /// Drop the front packet, which the caller peeked as `seq`.
-fn drop_front(state: &PresentState, seq: u64) {
+///
+/// A submit that superseded the peeked packet meanwhile left a newer one at
+/// the front or none; what made the presenter drop the one holds for the other.
+fn drop_front(state: &PresentState, _seq: u64) {
     {
         let mut inner = state.lock();
         if let Some(packet) = inner.pending.pop_front() {
-            debug_assert_eq!(packet.seq, seq, "only the presenter pops");
             drop_packet(&mut inner, packet);
         }
     }
@@ -966,9 +1009,13 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
 
     let mut inner = state.lock();
     let Some(front) = inner.pending.front() else {
+        // A newer frame superseded the packet while the drawable was awaited
+        // and has not been pushed yet; the drawable goes back unpresented.
         return true;
     };
-    debug_assert_eq!(front.seq, seq, "only the presenter pops");
+    // The packet at the front now, which is a newer one if a submit
+    // superseded the one peeked before the drawable came.
+    let seq = front.seq;
     let source_handle = front.slot.map_or(front.source, |index| {
         inner.slots[index]
             .as_ref()
